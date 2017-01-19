@@ -1,0 +1,168 @@
+---
+layout: post
+title:  "php-fpm"
+date:   2016-05-30 22:10:29 +0800
+categories: php
+---
+
+## 概要介绍
+
+### 定义
+
+php-fpm(PHP **FastCGI Process Manager**),从名字上可以看出，是一个实现了Fastcgi协议的进程管理器。Nov 23, 2009开始开发维护,从Nov 29, 2011的PHP 5.4.0RC2起，php-fpm进入了官方版本库。
+
+### php-fpm的特性
+
+包含并不限于:
+
+- 适应性的进程控制
+- 高级进程管理(优雅的(graceful)重启、关闭)
+- 异常情况下的紧急重启和opcode重建
+- 慢日志(slowlog)纪录
+- Fastcgi的增强，比如fastcgi_finish_request函数的实现，可以使得某些耗时请求提前返回给客户端，而后台继续执行
+
+### 名词解释
+
+#### SAPI: 抽象的Server接口
+
+作为php与外界环境的**桥梁层**，隔离并解耦php内核与外部环境。典型的sapi包括:
+
+- apache module
+- fastcgi
+- cli，命令行
+
+#### CGI(Common Gateway Interface):通用网关接口
+
+通俗的说，即一个建立在HTTP上层的协议（**这个说法可能不准确，个人理解**），通过该协议，能够实现一个http客户端与任意后端的交互，其中需要包含的核心字段为:
+
+- 后端的文件名，比如http://localhost:8123/cgi-bin/test?id=123中，后端服务的文件名为test
+- 参数，比如上例的url,参数为id，值为123
+- ...
+
+**一般认为,CGI对请求的处理策略为：每个请求，单folk出一个进程处理**
+
+#### FastCGI
+
+是对传统CGI的一种改进，在不考虑实现细节的前提下(当然fastcgi.c这个文件我也没细看),千言万语汇成一句话：
+
+**多个请求复用一个进程**
+
+### 总结
+
+有了上面的认知基础，那么我们知道了php-fpm就是一个：
+
+- 实现了fastcgi协议的
+- master(接收信号、管理worker)+worker(worker用来处理请求)的
+
+网络服务器(TCP Socket Server)，在PHP的范畴来说，一个**花式的**Fastcgi SAPI模块，所谓**花式**，是因为具有附加特性。
+
+## 实现原理
+
+### php-fpm的核心流程(守护**daemonize**模式)
+
+**Talk is Cheap, Show me the code**
+
+#### 代码路径
+
+```
+sapi/fpm/fpm/fpm_main.c
+```
+
+#### main(仅包含核心逻辑)
+
+```
+int main() {
+    // 全局变量区
+    
+    // zend_file_handle,用于打开php脚本文件
+    zend_file_handle file_handle;
+
+    // 超过max_request之后，worker进程将会重启,主要作用是为了消除扩展可能存在的内存泄露问题
+    int max_requests = 500; 
+
+    // 请求相关结构体
+    fcgi_request request;
+    
+    // 初始化
+
+    // 初始化sapi的相关结构体
+    sapi_startup(&cgi_sapi_module);
+
+    // fastcgi初始化:非win环境下就是初始化信号
+    fcgi_init(); 
+
+    // 回调startup初始化
+    if (cgi_sapi_module.startup(&cgi_sapi_module) == FAILURE) {
+    }
+
+    // 注意,若此时fpm运行在daemonize下,会folk出新进程作为后台进程,最初前台进程当init结束后退出
+    // 这个后台进程即fpm范畴的master进程
+    if(0 > fpm_init()) {
+        // 新老进程通过管道通信
+        // 成功发送1，失败发送0，老的前台进程判断管道数据后打日志退出
+    }
+
+    // 在fpm-run中folk出worker进程，master进程不会跳出这个函数,亦后面的都是子进程逻辑
+    fcgi_fd = fpm_run(&max_requests);
+
+    // 初始化请求相关结构体
+    // 不是每次都需要init
+    fcgi_init_request(&request, fcgi_fd);
+
+    // worker进程死循环接受请求
+    while (fcgi_accept_request(&request) >= 0) {
+        
+        // 传说中的PHP RINIT，即每次请求的初始化操作
+        php_request_startup();
+
+        // 打开脚本文件
+        if (php_fopen_primary_script(&file_handle TSRMLS_CC) == FAILURE) {
+        }
+            
+        // 操作scoreboard相关数据,scoreboard即一个在共享内存存储的worker相关信息的数据结构
+        fpm_request_executing();
+
+        // 执行php脚本,这里已经和fpm解耦
+        php_execute_script(&file_handle TSRMLS_CC);
+        
+        // 传说中的PHP RSHUTDOWN,即每次请求的析构操作
+        php_request_shutdown((void *) 0);
+        
+        // end process
+        // 收尾工作
+    }
+}
+```
+
+代码主要包括核心:
+
+1. 变量区
+2. 初始化
+3. **fpm_run()**:该函数是fpm:master+worker模式的核心实现，简单来说:
+
+- master进程进入fpm_event_loop死循环，利用io事件来接收/处理外界信号;利用timeout事件，来实现诸如Slow Request(慢请求，可配置)检测的功能
+- 子进程作为日后处理请求的worker进程，阻塞在fcgi_accept_request处
+
+#### Problem
+
+##### 为什么是IO事件?
+fpm巧妙创建了一对socket，保存在**sp**这个数组的前两位,当接收到信号时，sig_handler回调函数会向这个sp[1]写数据，而sp[0]位就会产生IO读事件，进而将信号转化为了io事件，在io模型中统一处理
+
+```
+int fpm_run(int* max_requests) {
+    for (wp = fpm_worker_all_pools; wp; wp = wp->next) {
+        // folk进程
+        is_parent = fpm_children_create_initial();
+        
+        // 子进程收尾后return
+        if (!is_parent) {
+            goto run_child;
+        }
+    }
+    
+    // 父进程进入死循环
+    fpm_event_loop();
+}
+```
+
+## 如有疑问，后续补充

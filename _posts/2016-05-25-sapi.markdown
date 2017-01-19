@@ -1,0 +1,12 @@
+---
+layout: post
+title:  "SAPI[todo]"
+date:   2016-05-25 23:45:06 +0800
+categories: php
+---
+
+## Introduction
+
+### 到底什么是SAPI?
+
+**Server Application Programming Interface**(SAPI)是一个通用的与WebServer交互的通用编程接口，通过这个接口可以解耦WebServer和PHP内核，以实现PHP与外界的透明对接。

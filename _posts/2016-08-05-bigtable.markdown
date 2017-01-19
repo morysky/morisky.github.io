@@ -1,0 +1,226 @@
+---
+layout: post
+title:  "[译]Bigtable: A Distributed Storage System for Strutured Data[todo]"
+date:   2016-08-05 12:39:06 +0800
+categories: stuff
+---
+
+## Intro
+
+> 译文分割线
+
+------
+
+## Author
+
+Fay Chang
+
+## 摘要
+
+Bigtable是一个管理结构化数据的分布式存储系统,它能够扩容至支持PB级的数据，却只需要使用数千台廉价(commodity)服务器。Bigtable在Google有很多的产品比如Google Earth、网页索引(Web indexing)、Google Finance来使用用于存储数据。这些应用寄予Bigtable的需求都不一样，但主要的共同点包括：海量数据(网页索引/卫星图像等)、低延迟(作为实时数据提供服务)。而Bigtable提供了一个灵活的、高性能的解决方案来满足这些产品的实际需求。本文将介绍Bigtable的基本数据模型,以提供客户端对数据布局(data layout)和格式的动态控制，进而描述Bigtable的设计和实现。
+
+## Chap1 背景和意义
+
+过去的两年半里，我们设计、实现、部署了一个称作Bigtable的分布式存储系统。Bigtable设计为能够可靠伸缩的PB级的结构化数据管理系统，并且运行在廉价机器上。Bigtable已经达成了一些目标：
+
+- 广泛应用
+- 可伸缩性
+- 高性能
+- 高可用
+
+Bigtable已应用在了Google的60多个产品线上，这些产品线主要有以下需求：
+
+- 高吞吐(throughout-oriented)的批处理任务
+- 低延迟，面向用户端
+- 存储上百TB的数据
+
+在很多场景下，Bigtable像一个数据库:它与数据库系统共同具有一些实现策略。很多并行、内存型数据库已经实现了扩展性和高性能，但与之不同的，Bigtable提供了一些不一样的接口。Bigtable不支持完整的关系数据模型(Relational data model),与之相反的，Bigtable提供了一个使用简单数据模型的客户端，来实现对数据布局(data layout)和格式的动态控制，而且允许客户端推断出(Reason about)底层存储中数据的本地属性(locality properties)。数据的行、列索引名字可以随意选取。Bigtable把数据看做是无解释(uninterpreted)的字符串，而客户端常常会序列化这些结构化和半结构化的数据为这种字符串。客户端通过选择不同的Schema，来控制局部数据。最后，Bigtable还能通过Schema的参数来控制数据来源于磁盘或是内存。
+
+章节提要:
+
+- 第二部分: 描述了数据模型的更多细节
+- 第三部分: 提供了客户端API的概览
+- 第四部分: 简要描述了Bigtable依赖的Google基础设施
+- 第五部分: 描述了Bigtable实现的基本原理
+- 第六部分: 描述了为了提高Bigtable性能的一些改进(refinements)
+- 第七部分: 描述了Bigtable的性能测试报告(measurements of performance)
+- 第八部分: 展示了Bigtable在Google的一些应用示例
+- 第九部分: 讨论设计和维护Bigtable时学到的经验总结
+- 第十部分: 描述一些其他的相关工作
+- 第十一部分: 发表我们的结论
+
+## Chap 2 数据模型
+
+Bigtable是一个**稀疏**的(sparse)、分布式的、持续多维的有序Map。Map具有一个行、列和时间戳的联合索引的键，而值是字节数组(an uninterpreted array of bytes)。
+
+![fig1](http://image20.it168.com/201011_0x0/358/efd9f44f922b0c6.jpg)
+
+###### 图1，存储网页的表的例子
+
+Row名字是一个反转的URL，**content**列族(column family)包含了网页内容，**anchor**列族包含了引用页面的锚点。CNN的主页被Sports和MY-look主页同时引用，因此该行包含了两个列:anchor:cnnsi.com和anchor:my.look.ca。每一个锚点单元有一个版本，content列有3个版本，时间戳分别为t3,t4,t6。
+
+我们调研了类似Bigtable的大量的潜在应用场景，选取了这样的数据模型。我们称这个特殊的，存储大量网页和相关信息的表为**Webtable**。
+
+### 行
+
+行的键在表中是任意的字符串(当前设置最大值为64Kb，然而一般用户都仅用10-100 bytes)。每一次的Row的读/写都是原子的，这使得客户端对于同一行的并发行为是能够预知的。
+
+Bigtable用Row Key的字典序(lexicographic)保存数据，行的范围是动态分区的，每个分区范围称作Tablet，是分布和负载均衡的基本单元。如此一来，少量row范围的读操作将会非常高效，只需要跟很很少的机器通信即可。客户端可以利用这个性质来选择Row Keys来获得更好的访问性能。比如在Webtable中，通过反转URL的主机名部分，同一个域名下的页面被聚合在连续的行中。例如，我们保存数据`maps.google.com/index.html`在Key`com.google.com/index.html`下。将相同域下的网页存储在邻近位置，使得主机和域名的分析更加高效。
+
+### 列族(Column Families)
+
+列Key用称作**column families**来进行分组，组织访问控制的基本单元。所有存储在一个列族的通常为同一类型(同一列族的数据会进行压缩)。列族在存储数据时必须首先被创建。表中唯一列族的数量很少(最多100)，而且操作时几乎不会改变。相反的，一个表可以有无限数量的列数。
+
+列名的命名规则如下:`family:qualifier`。列族的名字必须是可输出的(printable)，但分隔符可以是任意的字符串。Webtable中列族的一个例子是`language`，它存储了每个网页的语言ID。另一个有用的列族代表是`anchor`，如图1所示，每个Column Key在这个族里代表一个单一的锚点。分隔符是引用站点的名字，单元中的内容是链接文本。
+
+### 时间戳
+
+Bigtable中的每个单元(cell)包含同一数据的多个版本，版本都能用时间戳索引。Bigtable中的时间戳是64位整数。它能够由Bigtable分配，也能够由客户端应用指定。客户端应用需要生成唯一的时间戳以避免冲突。单元中的不同版本是按照时间戳降序存储的，这样最近版本会最先被读到。
+
+为了方便版本化数据的管理，我们支持两种**每列族**的设置，这样Bigtable能够进行版本的自动垃圾回收。客户端能够指定保存的版本数量，或者保存最近多久时间段的版本数据。
+
+在上面的Webtable例子中，我们设置爬虫网页存储的`contents`的时间戳:保存三个实际爬到的网页版本。垃圾回收机制使得我们最多保存每个网页的三个版本。
+
+## Chap 3 API
+
+Bigtable的API能够创建、删除表和列族，同样提供修改集群、表、列族元数据(比如访问控制权限)。
+
+```
+// Open the table
+Table *T = OpenOrDie("/bigtable/web/webtable");
+
+// 写入一个新的anchor，删除老的anchor
+RowMutation r1(T, "com.cnn.www");
+r1.Set("anchor:www.c-span.org", "CNN");
+r2.Delete("anchor:www.abc.com");
+Operation op;
+Apply(&op, &r1);
+```
+
+###### 图2，Bigtable的写入
+
+客户端应用程序能够写入/删除Bigtable中的数据，在独立的行中查询数据，或者遍历表中数据的子集。图2中，展示了使用C++用一个类`RowMutation`实现了一系列的更新。`Apply`完成了Webtable中数据的原子修改:它添加一个anchor，然后删除一个不同的。
+
+```
+Scanner scanner(T);
+ScanStream* stream;
+stream = scanner.FetchColumnFamily("anchor");
+stream->SetReturnAllVersions();
+scanner.Lookup("com.cnn.www");
+
+for(; !stream; stream->Next()) {
+    printf("%s %s %lld %s\n",
+        scanner.RowName(),
+        stream->ColumnName(),
+        stream->MicroTimestamp(),
+        stream->Value();
+    )    
+}
+```
+
+###### 图3，Bigtable的读
+
+图3展示了C++中用`Scanner`类迭代一个特定行中的所有anchor。客户端可以迭代多个列族，并有一些用来限制行，列和时间戳的机制。例如，我们能够使用正则表达式来限制，或者只查找时间戳距离现在10天之内的。
+
+Bigtable支持其他特性，让用户能够用多种方式操作数据。
+
+- Bigtable支持单行事务，能够执行单行的**读-改-写**序列。目前不支持跨RowKey的事务，但是提供了批量跨行写数据的接口。
+- Bigtable允许某个单元作为计数器。
+- Bigtable支持服务器的地址空间中的客户端脚本的执行。这些脚本使用Google开发的用于处理数据的**Sawzall**语言编写。
+
+目前基于Sawzall的API还不支持客户端脚本给Bigtable回溯数据(write back into)，但它能够实现不同的数据格式，用任意表达式进行过滤，通过不同操作器的类型汇总数据。
+
+Bigtable可以与MapReduce一起使用，MapReduce是Google开发用于大规模并行计算的框架。我们开发了一些Wrapper(包装器)使得可以将Bigtable作为MapReduce的输入或输出。
+
+## Chap 4 基础设施
+
+Bigtable是在很多Google基础设施之上构建的。Bigtable使用GFS(**Google File System**)来存储日志和数据文件。Bigtable集群在共享机器池运行大量的分布式应用，Bigtable进程也会共享机器的应用共享机器。Bigtable依赖集群管理系统来执行计划任务，管理共享机器资源，处理机器异常、监控机器状态。
+
+Google **SSTable**文件格式用于内部Bigtable数据的存储。SSTable提供持久化的、有序的键值对Map，键值对都是二进制字符串。它提供了给定一个键查询值的操作，而且能够遍历所有的键值对在指定的Key范围内。SSTable内部包含一系列的块(Blocks,通常一个Block是64KB，亦可配置)。一个块的索引(在SSTable的尾部)用来定位Block，当SSTable启动时就会加载索引到内存中。SSTable还有全内存模式，这样能够查找、搜索的更快。
+
+Bigtable依赖一个高可用的、持久的、分布式锁服务**Chubby**。一个Chubby服务包含5个副本，其中有一个被选为Master节点来提供请求服务。大多数副本保持运行且能够互相通信说明服务是可用的。Chubby使用**Paxox**算法来保证出现异常时的一致性。Chubby提供一个名字空间，其中包含目录和小文件。每个目录或文件都能被用作一个锁，每个文件的读写都是原子的。Chubby客户端库提供了Chubby文件的一致性Cache。每个Chubby客户端创建一个Chubby服务的会话。如果在设定的超时时间内无法刷新会话状态(renew the session lease)会话将失效。Chubby同样也可以注册Chubby中文件、目录产生修改或会话过期的回调。
+
+
+Bigtable使用Chubby做很多任务:
+
+- 保证最多只有一个Master节点
+- 存储Bigtable的骨架位置(Bootstrap location)
+- 发现tablet服务器，Server挂掉时回收资源
+- 存储Bigtable的Scheme信息
+- 存储访问控制列表
+
+当Chubby在一段时间不可用时，Bigtable也将不可用。我们近期内评估了一个横跨11个Chubby实例的14个Bigtable集群，因Chubby不可用引起的Bigtable中部分数据不可用的服务时间占比为0.0047%，而单个集群上这一数字为0.0326%。
+
+## Chap5 实现
+
+Bigtable实现包含三个主要组件：
+
+- 嵌入在每个客户端里的库
+- Master服务器
+- 许多Tablet服务器
+
+Tablet服务器可以在运行时在集群中动态添加/删除节点。
+
+Master的职责是分配tablet给Tablet服务器，检测Tablet服务器的添加和过期，负载均衡，GFS垃圾回收。另外，它还处理Schema的改变，诸如table或者列族的创建。
+
+每个Tablet服务器管理Tablet的集合(通常，每个Tablet服务器上有10到上千个Tablet)。Tablet服务器处理读写请求，切分增长为很大的Tablet。
+
+如许多单主的分布式存储系统一样，客户端数据不通过Master节点:客户端直接与Tablet服务器通信进行读写。因为Bigtable客户端不依赖Master节点上的Tablet位置信息，大多数的客户端不必与Master节点通信，这样使得在实际场景中，Master的负载压力很低。
+
+Bigtable集群存储大量的表。每个表包含Tablet的集合，每个Tablet包含一个行范围内的全部相关数据。初始时每个表仅包含一个Tablet。随着表的增长，它会自动切分成多个Tablet，默认每个Tablet大概占100-200MB的存储空间。
+
+### 5.1 Tablet位置(Tablet Location)
+
+我们用三层的B+树存储Tablet的位置信息，如图4。
+
+![fig4](http://p.blog.csdn.net/images/p_blog_csdn_net/cloudeep/EntryImages/20090810/4.jpg)
+
+###### 图4，Tablet的位置层级
+
+第一级是一个存储在Chubby中的包含根Tablet的位置。这个根Tablet在一个特殊的`METADATA`表中包含所有Tablet的位置。每个`METADATA`Tablet包含用户Tablet的集合。根Tablet即METADATA表中的第一个Tablet，但被特殊对待了:它不会被拆分，用以保证Tablet的位置等级不会超过三级。
+
+METADATA表存储了一个行Key下的Tablet的位置，它是Tablet的表ID和最后行的编码。每个`METADATA`行在内存中保存了大约1KB的数据。METADATA表有128MB的限制，我们的三级结构是足够的，在2^34个Tablet去寻址。
+
+客户端Cache了Tablet的位置。如果客户端不知道Tablet的位置，或者发现Cache住的位置信息错误，将递归提升Tablet位置的等级。如果客户端的Cache是空的，定位算法将需要三次网络交互(Network Round-trips)，包括一次从Chubby的读操作。如果客户端Cache过期(Stale)，定位算法需要6次交互，因为过期的Cache只有在发现未命中时出现。尽管表的定位信息都在内存中，因此不需要与GFS交互，通过预抓取table位置信息，我们仍进一步减小普通场景下的耗时：当读取`METADATA`表的时候，读取超过1个Tablet的数据。
+
+我们也存储了一些附属信息在`METADATA`中，包括每个Tablet的事件(诸如服务器何时启动)日志，这些信息对于debug和性能分析非常有用。
+
+### 5.2 Tablet分配
+
+同一时刻每个tablet分配给一个Tablet服务器。Master节点跟踪记录存活的Tablet服务器集合，当前已分配和未分配Tablet的Tablet服务器。当一个Tablet还未分配且Tablet服务器有足够的空间，Master节点通过发送一个Tablet载入请求给Tablet服务器。
+
+Bigtable使用Chubby来追踪每个Tablet服务器。Tablet服务器启动时，它创建并获取一个独占锁，即一个在Chubby特定目录下的唯一命名的文件。Master节点监控这个目录来发现Tablet服务器。Tablet服务器停止Tablet服务时释放独占锁：例如网络故障时(network partition)，会引起丢失Chubby的会话(Chubby提供高效机制允许Tablet服务器检查是否在没有流量时仍然占有锁)。Tablet服务器会尝试重新获取独占锁，只要文件存在。如果文件不存在，Tablet服务器将不能提供服务，会杀死自己的进程。无论何时Tablet服务器终止(例如集群管理系统将机器移除)，它会尝试释放锁以便Master节点能够很快重新分配Tablet。
+
+Master节点负责检测Tablet服务器是否存活，快速重新分配失效的Tablet。为了检测Tablet服务器是否正常，Master节点周期性的检查每个锁的状态。如果一个Tablet服务器报告丢失了锁，或者多次尝试但无法连接服务器，Master节点或重新尝试获取(acquire)排它锁。如果Master能够获取到锁，Chubby存活，但是Tablet服务器宕机或无法连接Chubby，Master节点将删除服务器文件以保证Tablet不会对外提供服务。一旦服务器文件被删除，注解点能移动所有的Tablet到未分配的Tablet。为了保证Bigtable集群不易受Chubby和Tablet之间网络问题影响，Master会在Chubby会话超时杀死自己。然而，如之前所说的，Master节点的异常不会改变Tablet在服务器上的分配。
+
+当一个Master被集群管理系统启动时，它需要在进行修改之前，发现当前Tablet分配情况。Master节点执行一系列的启动步骤。(1)Master获取一个Chubby上的唯一的Master排它锁，这能够阻止多个Master并发初始化。(2)Master扫描Chubby上的目录来寻找存活的服务器。(3)Master节点与每个存活的Tablet服务器通信，确保所有的Tablet是否已经分配给了Tablet服务器。(4)Master节点扫描`METADATA`表来获得Tablet的全集。当扫描过程中遇到某个Tablet未经分配，主节点将把这个Tablet添加到未分配集合中，使得后续能够被分配。
+
+一个复杂点在于当METADATA Tablet没有分配时，METADATA表的扫描无法进行。因此在开始扫描之前(第四步之前)，如果第三步时根Tablet的分配没有完成，Master节点添加根Tablet到未分配集合中。这个额外操作保证根Tablet一定能够被分配。因为根Tablet包含所有METADATA Tablet的名字，Master节点在扫描完成后就能获得所有Tablet的信息。
+
+已存在的Tablet的集合仅在创建或者删除表时发生修改，两个已存在的Tablet会归并成一个大的Tablet，或者一个分割成两个较小的Tablet。Master节点能够记录所有的改变，因为Master节点是最后一个初始化的。Tablet的分裂会被特殊对待从他们被Tablet服务器初始化之后。Tablet服务器通过在`METADATA`表中记录新Tablet的信息来提交分裂请求。当分裂操作被提交后，它会通知Master节点。当分割通知丢失时(Tablet服务器或者Master宕机)，Master会检测到新的Tablet,当它请求Tablet服务器去载入需要分裂的Tablet。Tablet服务器会通知Master分裂，因为Tablet入口发现`METADATA`表仅指定了Master请求载入的一个Tablet的一部分。
+
+## 5.3 Tablet服务
+
+Tablet的持久状态是存储在GFS上的（如图5中描述的）。更新操作被提交到一个提交日志中，存储了重做记录。这些更新，最近提交纪录存储在有序buffer中，称之为内存表(**memtable**)，更老的纪录存在一系列的SSTable中。恢复一个Tablet，一个Tablet服务器读取METADATA表中的元数据。元数据包含SSTable的列表，整合了表和redo点，redo点是一系列指向提交历史的指针，包含tablet的数据。服务器读取SSTable中的片段至内存，然后通过应用还原点后的所有提交，重建**memtable**。
+
+当一个Tablet服务器有一个写入请求时，服务器检查格式是否完整，发送者是否有变更的权限。权限控制是通过读取一个存储在Chubby上的授权写入者列表来实现的(通常都能够命中Chubby的客户端cache)。一个有效的变更写入到提交日志中(commit log)。许多小的变更采用分组提交的方式来提高系统的吞吐量。提交日志写入完毕后，内容才真正插入到memtable中。
+
+读请求类似，也需要检查格式完整性和授权。一个有序的读操作在一个归并了SSTable和memtable的数据序列上执行。数据采用的字母序的有序数据结构，访问能够高效完成。
+
+流入的读写操作能够在tablet分片和归并时不间断提供服务。
+
+## 5.4 压缩
+
+由于写操作执行时，memtable的大小会增长。当memtable大小超限时，memtable将会冻结，创建新的memtable，老的memtable会转化成SSTable写入GFS中。最小压缩进程有两个目标：减少内存消耗，减少服务器恢复时需要读取的提交日志数据量。压缩进程不会影响正常读写。
+
+每个最小压缩会创建新的SSTable。如果这个行为不经检查，那么读操作将需要归并大量的SSTable。为了解决这个问题，我们后台周期性地执行归并压缩操作。一个归并压缩读取一些SSTable和memtable，然后写入新的SSTable。输入的SSTable和memtable将在压缩结束后很快释放。
+
+一个归并压缩操作重写了所有SSTable为一个SSTable被称作最大压缩。非最大压缩的SSTable包含已经删除的数据。Bigtable循环地遍历tablet然后应用最大压缩操作。这些最大压缩允许Bigtable重新回收删除数据的资源，使得删除的数据及时在系统中消失，这对一些存储敏感数据的应用来说非常重要。
+
+# 6 重定义
+
+前面章节的描述的实现需要大量的重定义来达到高性能，高可用性，高可靠性。本章将描述实现的更多细节，并着重强调这些重定义。
+
+## 本地分组
+
+客户端可以将多个列族一起分为一个```本地组```。
