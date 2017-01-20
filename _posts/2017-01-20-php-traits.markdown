@@ -11,12 +11,11 @@ categories: php
 
 # What is Traits
 
-Traits是单继承语言的一种重用机制，这种特性怎么能在PHP(**世界最好的语言**)缺席呢?Traits在Ruby中叫**Mixins**（crispm提醒）,感觉这个名字更容易理解。Traits能够使用户更方便的使用不在一个类层级的独立类，同时避免多继承和Mixins的诡异问题（多继承、函数重名）。
+Traits是单继承语言的一种重用机制，这种特性怎么能在PHP(**世界最好的语言**)缺席呢?Traits在Ruby中叫**Mixins**（crispm提醒）,感觉这个名字更容易理解。Traits能够使用户更方便的使用不在一个类层级的独立类，同时避免多继承和Mixins的诡异问题（函数重名）。
 
 # PHP Traits
 
 ## Eg1
-
 ```
 <?php
 
@@ -37,8 +36,6 @@ class World {
 $o = new World();
 $o->sayHelloA();
 $o->sayHelloB();
-
-?>
 ```
 
 可能你还觉得上面的例子没有说明什么，那么你看看传统方法的实现:
@@ -48,6 +45,7 @@ class HelloA {
     public static function sayHelloA() {
     }
 }
+
 class HelloB {
     public static function sayHelloB() {
     }
@@ -67,4 +65,10 @@ $o -> sayHelloA();
 $o -> sayHelloB();
 ```
 
-< 如果不用Trait,面向对象的代码可能会很丑陋
+> 如果不用Trait,面向对象的代码可能会很丑陋
+
+## 使用场景
+
+究竟哪些场景适合做成Trait呢？
+
+- 外部工具
