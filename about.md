@@ -6,4 +6,4 @@ permalink: /about/
 
 A Coder
 
-Now At Baidu
+Now At Shell.
